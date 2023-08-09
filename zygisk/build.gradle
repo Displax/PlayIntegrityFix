@@ -4,12 +4,8 @@ plugins {
 
 android {
     namespace 'com.example.zygisk'
-    ndkVersion '25.2.9519653'
+    ndkVersion '26.0.10404224 rc1'
     compileSdk 34
-
-    buildFeatures {
-        prefab true
-    }
 
     defaultConfig {
         minSdk 26
@@ -18,7 +14,9 @@ android {
             cmake {
                 arguments '-DCMAKE_BUILD_TYPE=Release',
                         '-DCMAKE_CXX_STANDARD=23',
-                        '-DCMAKE_CXX_STANDARD_REQUIRED=ON'
+                        '-DCMAKE_CXX_STANDARD_REQUIRED=ON',
+                        '-DCMAKE_C_STANDARD=23',
+                        '-DCMAKE_C_STANDARD_REQUIRED=ON'
                 cppFlags '-fno-exceptions',
                         '-fno-rtti',
                         '-fvisibility=hidden',
@@ -36,4 +34,5 @@ android {
             path 'jni/CMakeLists.txt'
         }
     }
+    buildToolsVersion '34.0.0'
 }

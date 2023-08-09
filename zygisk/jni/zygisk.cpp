@@ -4,9 +4,27 @@
 #include <android/log.h>
 #include <sys/system_properties.h>
 #include <sys/socket.h>
-#include <filesystem>
+#include <vector>
+#include <fstream>
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "SNFix/Zygisk", __VA_ARGS__)
+
+static void companion(int fd) {
+    std::ifstream ifs("/data/adb/SNFix.dex", std::ios::binary | std::ios::ate);
+    int size = ifs.tellg();
+    ifs.seekg(std::ios::beg);
+
+    send(fd, &size, sizeof(size), 0);
+
+    std::vector<char> dexFile(size);
+    ifs.read(dexFile.data(), size);
+
+    send(fd, dexFile.data(), size, 0);
+
+    ifs.close();
+    dexFile.clear();
+    dexFile.shrink_to_fit();
+}
 
 typedef void (*T_Callback)(void *, const char *, const char *, uint32_t);
 
@@ -17,8 +35,8 @@ static T_Callback o_callback;
 static void
 handle_system_property(void *cookie, const char *name, const char *value, uint32_t serial) {
     if (std::string_view(name).compare("ro.product.first_api_level") == 0) {
-        LOGI("Set first_api_level to 33, original value: %s", value);
-        value = "33";
+        LOGI("Set first_api_level to 32, original value: %s", value);
+        value = "32";
     }
     o_callback(cookie, name, value, serial);
 }
@@ -28,6 +46,13 @@ static void my_hook(const prop_info *pi, T_Callback callback, void *cookie) {
     o_hook(pi, handle_system_property, cookie);
 }
 
+static bool isFirstApiLevelGreater32() {
+    char value[PROP_VALUE_MAX];
+    if (__system_property_get("ro.product.first_api_level", value) < 1) return false;
+    int first_api_level = std::atoi(value);
+    return first_api_level > 32;
+}
+
 using namespace zygisk;
 
 class PlayIntegrityFix : public ModuleBase {
@@ -35,6 +60,7 @@ public:
     void onLoad(Api *api, JNIEnv *env) override {
         this->api = api;
         this->env = env;
+        this->hookProps = false;
     }
 
     void preAppSpecialize(AppSpecializeArgs *args) override {
@@ -43,32 +69,25 @@ public:
         env->ReleaseStringUTFChars(args->nice_name, rawProcess);
 
         if (!process.starts_with("com.google.android.gms")) {
-            process.clear();
-            process.shrink_to_fit();
-            api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+            api->setOption(DLCLOSE_MODULE_LIBRARY);
             return;
         }
 
-        api->setOption(zygisk::FORCE_DENYLIST_UNMOUNT);
+        api->setOption(FORCE_DENYLIST_UNMOUNT);
 
-        if (process == "com.google.android.gms.unstable") {
-            auto rawAppDir = env->GetStringUTFChars(args->app_data_dir, nullptr);
-            appDir = rawAppDir;
-            env->ReleaseStringUTFChars(args->app_data_dir, rawAppDir);
-
-            int fd = api->connectCompanion();
-            int strSize = (int) appDir.size();
-            send(fd, &strSize, sizeof(strSize), 0);
-            send(fd, appDir.data(), appDir.size(), 0);
-            bool correct;
-            recv(fd, &correct, sizeof(correct), 0);
-            close(fd);
-
-            if (!correct) {
-                appDir.clear();
-                appDir.shrink_to_fit();
-                api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+        if (process.ends_with("unstable")) {
+            hookProps = isFirstApiLevelGreater32();
+            if (!hookProps) {
+                api->setOption(DLCLOSE_MODULE_LIBRARY);
             }
+            int fd = api->connectCompanion();
+            int size;
+            recv(fd, &size, sizeof(size), 0);
+            dexFile.resize(size);
+            recv(fd, dexFile.data(), size, 0);
+            close(fd);
+        } else {
+            api->setOption(DLCLOSE_MODULE_LIBRARY);
         }
 
         process.clear();
@@ -76,18 +95,21 @@ public:
     }
 
     void postAppSpecialize(const AppSpecializeArgs *args) override {
-        if (appDir.empty()) return;
+        if (dexFile.empty()) return;
 
-        LOGI("hooking");
-        void *handle = DobbySymbolResolver(nullptr, "__system_property_read_callback");
-        if (handle == nullptr) {
-            LOGI("Error, can't get __system_property_read_callback handle");
-            appDir.clear();
-            appDir.shrink_to_fit();
-            return;
+        LOGI("Dex file size: %d", (int) dexFile.size());
+
+        if (hookProps) {
+            void *handle = DobbySymbolResolver(nullptr, "__system_property_read_callback");
+            if (handle == nullptr) {
+                LOGI("Error, can't get handle");
+                dexFile.clear();
+                dexFile.shrink_to_fit();
+                return;
+            }
+            LOGI("Got handle at %p", handle);
+            DobbyHook(handle, (dobby_dummy_func_t) my_hook, (dobby_dummy_func_t *) &o_hook);
         }
-        LOGI("Get __system_property_read_callback at %p", handle);
-        DobbyHook(handle, (dobby_dummy_func_t) my_hook, (dobby_dummy_func_t *) &o_hook);
 
         LOGI("get system classloader");
         auto clClass = env->FindClass("java/lang/ClassLoader");
@@ -95,13 +117,12 @@ public:
                                                            "()Ljava/lang/ClassLoader;");
         auto systemClassLoader = env->CallStaticObjectMethod(clClass, getSystemClassLoader);
 
-        auto dexFile = env->NewStringUTF(std::string(appDir + "/SNFix.dex").c_str());
-
-        LOGI("create PathClassLoader");
-        auto dexClClass = env->FindClass("dalvik/system/PathClassLoader");
+        LOGI("create InMemoryDexClassLoader");
+        auto dexClClass = env->FindClass("dalvik/system/InMemoryDexClassLoader");
         auto dexClInit = env->GetMethodID(dexClClass, "<init>",
-                                          "(Ljava/lang/String;Ljava/lang/ClassLoader;)V");
-        auto dexCl = env->NewObject(dexClClass, dexClInit, dexFile, systemClassLoader);
+                                          "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
+        auto buffer = env->NewDirectByteBuffer(dexFile.data(), dexFile.size());
+        auto dexCl = env->NewObject(dexClClass, dexClInit, buffer, systemClassLoader);
 
         LOGI("load class");
         auto loadClass = env->GetMethodID(clClass, "loadClass",
@@ -115,12 +136,12 @@ public:
         env->CallStaticVoidMethod(entryClass, entryInit);
 
         LOGI("cleaning");
-        appDir.clear();
-        appDir.shrink_to_fit();
+        dexFile.clear();
+        dexFile.shrink_to_fit();
         env->DeleteLocalRef(clClass);
         env->DeleteLocalRef(systemClassLoader);
-        env->DeleteLocalRef(dexFile);
         env->DeleteLocalRef(dexClClass);
+        env->DeleteLocalRef(buffer);
         env->DeleteLocalRef(dexCl);
         env->DeleteLocalRef(entryClassName);
         env->DeleteLocalRef(entryClassObj);
@@ -134,33 +155,9 @@ public:
 private:
     Api *api;
     JNIEnv *env;
-    std::string appDir;
+    std::vector<char> dexFile;
+    bool hookProps;
 };
-
-static void companion(int fd) {
-    int strSize;
-    recv(fd, &strSize, sizeof(strSize), 0);
-
-    std::string appDir;
-    appDir.resize(strSize);
-
-    recv(fd, appDir.data(), appDir.size(), 0);
-
-    LOGI("[ROOT] Received app data dir from socket: %s", appDir.c_str());
-
-    bool correct = std::filesystem::copy_file("/data/adb/SNFix.dex",
-                                              appDir + "/SNFix.dex",
-                                              std::filesystem::copy_options::overwrite_existing);
-
-    if (correct) {
-        std::filesystem::permissions(appDir + "/SNFix.dex",
-                                     std::filesystem::perms::group_read |
-                                     std::filesystem::perms::owner_read |
-                                     std::filesystem::perms::others_read);
-    }
-
-    send(fd, &correct, sizeof(correct), 0);
-}
 
 REGISTER_ZYGISK_MODULE(PlayIntegrityFix)
 
